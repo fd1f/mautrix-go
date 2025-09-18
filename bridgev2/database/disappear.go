@@ -12,26 +12,53 @@ import (
 	"time"
 
 	"go.mau.fi/util/dbutil"
+	"go.mau.fi/util/jsontime"
 
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
-// DisappearingType represents the type of a disappearing message timer.
-type DisappearingType string
+// Deprecated: use [event.DisappearingType]
+type DisappearingType = event.DisappearingType
 
+// Deprecated: use constants in event package
 const (
-	DisappearingTypeNone      DisappearingType = ""
-	DisappearingTypeAfterRead DisappearingType = "after_read"
-	DisappearingTypeAfterSend DisappearingType = "after_send"
+	DisappearingTypeNone      = event.DisappearingTypeNone
+	DisappearingTypeAfterRead = event.DisappearingTypeAfterRead
+	DisappearingTypeAfterSend = event.DisappearingTypeAfterSend
 )
 
 // DisappearingSetting represents a disappearing message timer setting
 // by combining a type with a timer and an optional start timestamp.
 type DisappearingSetting struct {
-	Type        DisappearingType
+	Type        event.DisappearingType
 	Timer       time.Duration
 	DisappearAt time.Time
+}
+
+func (ds DisappearingSetting) Normalize() DisappearingSetting {
+	if ds.Type == event.DisappearingTypeNone {
+		ds.Timer = 0
+	} else if ds.Timer == 0 {
+		ds.Type = event.DisappearingTypeNone
+	}
+	return ds
+}
+
+func (ds DisappearingSetting) StartingAt(start time.Time) DisappearingSetting {
+	ds.DisappearAt = start.Add(ds.Timer)
+	return ds
+}
+
+func (ds DisappearingSetting) ToEventContent() *event.BeeperDisappearingTimer {
+	if ds.Type == event.DisappearingTypeNone || ds.Timer == 0 {
+		return &event.BeeperDisappearingTimer{}
+	}
+	return &event.BeeperDisappearingTimer{
+		Type:  ds.Type,
+		Timer: jsontime.MS(ds.Timer),
+	}
 }
 
 type DisappearingMessageQuery struct {
@@ -61,7 +88,7 @@ const (
 	getUpcomingDisappearingMessagesQuery = `
 		SELECT bridge_id, mx_room, mxid, type, timer, disappear_at
 		FROM disappearing_message WHERE bridge_id = $1 AND disappear_at IS NOT NULL AND disappear_at < $2
-		ORDER BY disappear_at
+		ORDER BY disappear_at LIMIT $3
 	`
 	deleteDisappearingMessageQuery = `
 		DELETE FROM disappearing_message WHERE bridge_id=$1 AND mxid=$2
@@ -77,8 +104,8 @@ func (dmq *DisappearingMessageQuery) StartAll(ctx context.Context, roomID id.Roo
 	return dmq.QueryMany(ctx, startDisappearingMessagesQuery, time.Now().UnixNano(), dmq.BridgeID, roomID)
 }
 
-func (dmq *DisappearingMessageQuery) GetUpcoming(ctx context.Context, duration time.Duration) ([]*DisappearingMessage, error) {
-	return dmq.QueryMany(ctx, getUpcomingDisappearingMessagesQuery, dmq.BridgeID, time.Now().Add(duration).UnixNano())
+func (dmq *DisappearingMessageQuery) GetUpcoming(ctx context.Context, duration time.Duration, limit int) ([]*DisappearingMessage, error) {
+	return dmq.QueryMany(ctx, getUpcomingDisappearingMessagesQuery, dmq.BridgeID, time.Now().Add(duration).UnixNano(), limit)
 }
 
 func (dmq *DisappearingMessageQuery) Delete(ctx context.Context, eventID id.EventID) error {

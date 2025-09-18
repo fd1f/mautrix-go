@@ -58,6 +58,10 @@ func (as *ASIntent) SendMessage(ctx context.Context, roomID id.RoomID, eventType
 		})
 	}
 	if eventType != event.EventReaction && eventType != event.EventRedaction {
+		msgContent, ok := content.Parsed.(*event.MessageEventContent)
+		if ok {
+			msgContent.AddPerMessageProfileFallback()
+		}
 		if encrypted, err := as.Matrix.StateStore.IsEncrypted(ctx, roomID); err != nil {
 			return nil, fmt.Errorf("failed to check if room is encrypted: %w", err)
 		} else if encrypted {
@@ -393,9 +397,13 @@ func (as *ASIntent) UploadMediaStream(
 		err = fmt.Errorf("failed to get temp file info: %w", err)
 		return
 	}
+	size = info.Size()
+	if size > as.Connector.MediaConfig.UploadSize {
+		return "", nil, fmt.Errorf("file too large (%.2f MB > %.2f MB)", float64(size)/1000/1000, float64(as.Connector.MediaConfig.UploadSize)/1000/1000)
+	}
 	req := mautrix.ReqUploadMedia{
 		Content:       replFile,
-		ContentLength: info.Size(),
+		ContentLength: size,
 		ContentType:   res.MimeType,
 		FileName:      res.FileName,
 	}
@@ -482,8 +490,12 @@ func (as *ASIntent) IsDoublePuppet() bool {
 	return as.Matrix.IsDoublePuppet()
 }
 
-func (as *ASIntent) EnsureJoined(ctx context.Context, roomID id.RoomID) error {
-	err := as.Matrix.EnsureJoined(ctx, roomID)
+func (as *ASIntent) EnsureJoined(ctx context.Context, roomID id.RoomID, extra ...bridgev2.EnsureJoinedParams) error {
+	var params bridgev2.EnsureJoinedParams
+	if len(extra) > 0 {
+		params = extra[0]
+	}
+	err := as.Matrix.EnsureJoined(ctx, roomID, appservice.EnsureJoinedParams{Via: params.Via})
 	if err != nil {
 		return err
 	}
@@ -566,7 +578,15 @@ func (as *ASIntent) MarkAsDM(ctx context.Context, roomID id.RoomID, withUser id.
 
 func (as *ASIntent) DeleteRoom(ctx context.Context, roomID id.RoomID, puppetsOnly bool) error {
 	if as.Connector.SpecVersions.Supports(mautrix.BeeperFeatureRoomYeeting) {
-		return as.Matrix.BeeperDeleteRoom(ctx, roomID)
+		err := as.Matrix.BeeperDeleteRoom(ctx, roomID)
+		if err != nil {
+			return err
+		}
+		err = as.Matrix.StateStore.ClearCachedMembers(ctx, roomID)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Msg("Failed to clear cached members while cleaning up portal")
+		}
+		return nil
 	}
 	members, err := as.Matrix.JoinedMembers(ctx, roomID)
 	if err != nil {
@@ -653,4 +673,24 @@ func (as *ASIntent) MuteRoom(ctx context.Context, roomID id.RoomID, until time.T
 			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
 		})
 	}
+}
+
+func (as *ASIntent) GetEvent(ctx context.Context, roomID id.RoomID, eventID id.EventID) (*event.Event, error) {
+	evt, err := as.Matrix.Client.GetEvent(ctx, roomID, eventID)
+	if err != nil {
+		return nil, err
+	}
+	err = evt.Content.ParseRaw(evt.Type)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Stringer("room_id", roomID).Stringer("event_id", eventID).Msg("failed to parse event content")
+	}
+
+	if evt.Type == event.EventEncrypted {
+		if as.Connector.Config.Encryption.DeleteKeys.RatchetOnDecrypt {
+			return nil, errors.New("can't decrypt the event")
+		}
+		return as.Matrix.Crypto.Decrypt(ctx, evt)
+	}
+
+	return evt, nil
 }

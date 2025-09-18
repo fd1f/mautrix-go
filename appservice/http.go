@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tulir Asokan
+// Copyright (c) 2025 Tulir Asokan
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exhttp"
 	"go.mau.fi/util/exstrings"
 
 	"maunium.net/go/mautrix"
@@ -79,17 +79,9 @@ func (as *AppService) Stop() {
 func (as *AppService) CheckServerToken(w http.ResponseWriter, r *http.Request) (isValid bool) {
 	authHeader := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		Error{
-			ErrorCode:  ErrUnknownToken,
-			HTTPStatus: http.StatusForbidden,
-			Message:    "Missing access token",
-		}.Write(w)
+		mautrix.MMissingToken.WithMessage("Missing access token").Write(w)
 	} else if !exstrings.ConstantTimeEqual(authHeader[len("Bearer "):], as.Registration.ServerToken) {
-		Error{
-			ErrorCode:  ErrUnknownToken,
-			HTTPStatus: http.StatusForbidden,
-			Message:    "Incorrect access token",
-		}.Write(w)
+		mautrix.MUnknownToken.WithMessage("Invalid access token").Write(w)
 	} else {
 		isValid = true
 	}
@@ -102,24 +94,15 @@ func (as *AppService) PutTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vars := mux.Vars(r)
-	txnID := vars["txnID"]
+	txnID := r.PathValue("txnID")
 	if len(txnID) == 0 {
-		Error{
-			ErrorCode:  ErrNoTransactionID,
-			HTTPStatus: http.StatusBadRequest,
-			Message:    "Missing transaction ID",
-		}.Write(w)
+		mautrix.MInvalidParam.WithMessage("Missing transaction ID").Write(w)
 		return
 	}
 	defer r.Body.Close()
 	body, err := io.ReadAll(r.Body)
 	if err != nil || len(body) == 0 {
-		Error{
-			ErrorCode:  ErrNotJSON,
-			HTTPStatus: http.StatusBadRequest,
-			Message:    "Missing request body",
-		}.Write(w)
+		mautrix.MNotJSON.WithMessage("Failed to read response body").Write(w)
 		return
 	}
 	log := as.Log.With().Str("transaction_id", txnID).Logger()
@@ -128,7 +111,7 @@ func (as *AppService) PutTransaction(w http.ResponseWriter, r *http.Request) {
 	ctx = log.WithContext(ctx)
 	if as.txnIDC.IsProcessed(txnID) {
 		// Duplicate transaction ID: no-op
-		WriteBlankOK(w)
+		exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 		log.Debug().Msg("Ignoring duplicate transaction")
 		return
 	}
@@ -137,14 +120,10 @@ func (as *AppService) PutTransaction(w http.ResponseWriter, r *http.Request) {
 	err = json.Unmarshal(body, &txn)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to parse transaction content")
-		Error{
-			ErrorCode:  ErrBadJSON,
-			HTTPStatus: http.StatusBadRequest,
-			Message:    "Failed to parse body JSON",
-		}.Write(w)
+		mautrix.MBadJSON.WithMessage("Failed to parse transaction content").Write(w)
 	} else {
 		as.handleTransaction(ctx, txnID, &txn)
-		WriteBlankOK(w)
+		exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 	}
 }
 
@@ -222,7 +201,7 @@ func (as *AppService) handleEvents(ctx context.Context, evts []*event.Event, def
 		}
 		err := evt.Content.ParseRaw(evt.Type)
 		if errors.Is(err, event.ErrUnsupportedContentType) {
-			log.Debug().Str("event_id", evt.ID.String()).Msg("Not parsing content of unsupported event")
+			log.Debug().Stringer("event_id", evt.ID).Msg("Not parsing content of unsupported event")
 		} else if err != nil {
 			log.Warn().Err(err).
 				Str("event_id", evt.ID.String()).
@@ -259,16 +238,12 @@ func (as *AppService) GetRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vars := mux.Vars(r)
-	roomAlias := vars["roomAlias"]
+	roomAlias := id.RoomAlias(r.PathValue("roomAlias"))
 	ok := as.QueryHandler.QueryAlias(roomAlias)
 	if ok {
-		WriteBlankOK(w)
+		exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 	} else {
-		Error{
-			ErrorCode:  ErrUnknown,
-			HTTPStatus: http.StatusNotFound,
-		}.Write(w)
+		mautrix.MNotFound.WithMessage("Alias not found").Write(w)
 	}
 }
 
@@ -278,16 +253,12 @@ func (as *AppService) GetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vars := mux.Vars(r)
-	userID := id.UserID(vars["userID"])
+	userID := id.UserID(r.PathValue("userID"))
 	ok := as.QueryHandler.QueryUser(userID)
 	if ok {
-		WriteBlankOK(w)
+		exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 	} else {
-		Error{
-			ErrorCode:  ErrUnknown,
-			HTTPStatus: http.StatusNotFound,
-		}.Write(w)
+		mautrix.MNotFound.WithMessage("User not found").Write(w)
 	}
 }
 
@@ -297,11 +268,7 @@ func (as *AppService) PostPing(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil || len(body) == 0 || !json.Valid(body) {
-		Error{
-			ErrorCode:  ErrNotJSON,
-			HTTPStatus: http.StatusBadRequest,
-			Message:    "Missing request body",
-		}.Write(w)
+		mautrix.MNotJSON.WithMessage("Invalid or missing request body").Write(w)
 		return
 	}
 
@@ -309,27 +276,21 @@ func (as *AppService) PostPing(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &txn)
 	as.Log.Debug().Str("txn_id", txn.TxnID).Msg("Received ping from homeserver")
 
-	w.Header().Add("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("{}"))
+	exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 }
 
 func (as *AppService) GetLive(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Content-Type", "application/json")
 	if as.Live {
-		w.WriteHeader(http.StatusOK)
+		exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 	} else {
-		w.WriteHeader(http.StatusInternalServerError)
+		exhttp.WriteEmptyJSONResponse(w, http.StatusInternalServerError)
 	}
-	w.Write([]byte("{}"))
 }
 
 func (as *AppService) GetReady(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Content-Type", "application/json")
 	if as.Ready {
-		w.WriteHeader(http.StatusOK)
+		exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 	} else {
-		w.WriteHeader(http.StatusInternalServerError)
+		exhttp.WriteEmptyJSONResponse(w, http.StatusInternalServerError)
 	}
-	w.Write([]byte("{}"))
 }

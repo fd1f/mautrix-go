@@ -11,16 +11,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"strings"
 	"time"
 
-	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"go.mau.fi/util/exgjson"
 	"go.mau.fi/util/jsontime"
 
 	"maunium.net/go/mautrix/crypto/canonicaljson"
+	"maunium.net/go/mautrix/federation/signutil"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -35,8 +33,8 @@ type SigningKey struct {
 //
 // The output of this function can be parsed back into a [SigningKey] using the [ParseSynapseKey] function.
 func (sk *SigningKey) SynapseString() string {
-	alg, id := sk.ID.Parse()
-	return fmt.Sprintf("%s %s %s", alg, id, base64.RawStdEncoding.EncodeToString(sk.Priv.Seed()))
+	alg, keyID := sk.ID.Parse()
+	return fmt.Sprintf("%s %s %s", alg, keyID, base64.RawStdEncoding.EncodeToString(sk.Priv.Seed()))
 }
 
 // ParseSynapseKey parses a Synapse-compatible private key string into a SigningKey.
@@ -82,7 +80,11 @@ type ServerKeyResponse struct {
 	Signatures    map[string]map[id.KeyID]string `json:"signatures,omitempty"`
 	ValidUntilTS  jsontime.UnixMilli             `json:"valid_until_ts"`
 
-	Extra map[string]any `json:"-"`
+	Raw json.RawMessage `json:"-"`
+}
+
+type QueryKeysResponse struct {
+	ServerKeys []*ServerKeyResponse `json:"server_keys"`
 }
 
 func (skr *ServerKeyResponse) HasKey(keyID id.KeyID) bool {
@@ -94,88 +96,20 @@ func (skr *ServerKeyResponse) HasKey(keyID id.KeyID) bool {
 	return false
 }
 
-func (skr *ServerKeyResponse) VerifySelfSignature() bool {
+func (skr *ServerKeyResponse) VerifySelfSignature() error {
 	for keyID, key := range skr.VerifyKeys {
-		if !VerifyJSON(skr.ServerName, keyID, key.Key, skr) {
-			return false
+		if err := signutil.VerifyJSON(skr.ServerName, keyID, key.Key, skr.Raw); err != nil {
+			return fmt.Errorf("failed to verify self signature for key %s: %w", keyID, err)
 		}
 	}
-	return true
-}
-
-func VerifyJSON(serverName string, keyID id.KeyID, key id.SigningKey, data any) bool {
-	var err error
-	message, ok := data.(json.RawMessage)
-	if !ok {
-		message, err = json.Marshal(data)
-		if err != nil {
-			return false
-		}
-	}
-	sigVal := gjson.GetBytes(message, exgjson.Path("signatures", serverName, string(keyID)))
-	if sigVal.Type != gjson.String {
-		return false
-	}
-	message, err = sjson.DeleteBytes(message, "signatures")
-	if err != nil {
-		return false
-	}
-	message, err = sjson.DeleteBytes(message, "unsigned")
-	if err != nil {
-		return false
-	}
-	return VerifyJSONRaw(key, sigVal.Str, message)
-}
-
-func VerifyJSONRaw(key id.SigningKey, sig string, message json.RawMessage) bool {
-	sigBytes, err := base64.RawURLEncoding.DecodeString(sig)
-	if err != nil {
-		return false
-	}
-	keyBytes, err := base64.RawStdEncoding.DecodeString(string(key))
-	if err != nil {
-		return false
-	}
-	message = canonicaljson.CanonicalJSONAssumeValid(message)
-	return ed25519.Verify(keyBytes, message, sigBytes)
+	return nil
 }
 
 type marshalableSKR ServerKeyResponse
 
-func (skr *ServerKeyResponse) MarshalJSON() ([]byte, error) {
-	if skr.Extra == nil {
-		return json.Marshal((*marshalableSKR)(skr))
-	}
-	marshalable := maps.Clone(skr.Extra)
-	marshalable["server_name"] = skr.ServerName
-	marshalable["verify_keys"] = skr.VerifyKeys
-	marshalable["old_verify_keys"] = skr.OldVerifyKeys
-	marshalable["signatures"] = skr.Signatures
-	marshalable["valid_until_ts"] = skr.ValidUntilTS
-	return json.Marshal(skr.Extra)
-}
-
 func (skr *ServerKeyResponse) UnmarshalJSON(data []byte) error {
-	err := json.Unmarshal(data, (*marshalableSKR)(skr))
-	if err != nil {
-		return err
-	}
-	var extra map[string]any
-	err = json.Unmarshal(data, &extra)
-	if err != nil {
-		return err
-	}
-	delete(extra, "server_name")
-	delete(extra, "verify_keys")
-	delete(extra, "old_verify_keys")
-	delete(extra, "signatures")
-	delete(extra, "valid_until_ts")
-	if len(extra) > 0 {
-		skr.Extra = extra
-	} else {
-		skr.Extra = nil
-	}
-	return nil
+	skr.Raw = data
+	return json.Unmarshal(data, (*marshalableSKR)(skr))
 }
 
 type ServerVerifyKey struct {

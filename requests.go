@@ -2,6 +2,7 @@ package mautrix
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -38,6 +39,26 @@ const (
 )
 
 type Direction rune
+
+func (d Direction) MarshalJSON() ([]byte, error) {
+	return json.Marshal(string(d))
+}
+
+func (d *Direction) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return err
+	}
+	switch str {
+	case "f":
+		*d = DirectionForward
+	case "b":
+		*d = DirectionBackward
+	default:
+		return fmt.Errorf("invalid direction %q, must be 'f' or 'b'", str)
+	}
+	return nil
+}
 
 const (
 	DirectionForward  Direction = 'f'
@@ -120,11 +141,12 @@ type ReqCreateRoom struct {
 	InitialState    []*event.Event         `json:"initial_state,omitempty"`
 	Preset          string                 `json:"preset,omitempty"`
 	IsDirect        bool                   `json:"is_direct,omitempty"`
-	RoomVersion     string                 `json:"room_version,omitempty"`
+	RoomVersion     id.RoomVersion         `json:"room_version,omitempty"`
 
 	PowerLevelOverride *event.PowerLevelsEventContent `json:"power_level_content_override,omitempty"`
 
 	MeowRoomID            id.RoomID   `json:"fi.mau.room_id,omitempty"`
+	MeowCreateTS          int64       `json:"fi.mau.origin_server_ts,omitempty"`
 	BeeperInitialMembers  []id.UserID `json:"com.beeper.initial_members,omitempty"`
 	BeeperAutoJoinInvites bool        `json:"com.beeper.auto_join_invites,omitempty"`
 	BeeperLocalRoomID     id.RoomID   `json:"com.beeper.local_room_id,omitempty"`
@@ -193,6 +215,8 @@ type ReqKickUser struct {
 type ReqBanUser struct {
 	Reason string    `json:"reason,omitempty"`
 	UserID id.UserID `json:"user_id"`
+
+	MSC4293RedactEvents bool `json:"org.matrix.msc4293.redact_events,omitempty"`
 }
 
 // ReqUnbanUser is the JSON request for https://spec.matrix.org/v1.2/client-server-api/#post_matrixclientv3roomsroomidunban
@@ -377,18 +401,6 @@ type ReqPutPushRule struct {
 	Pattern    string                     `json:"pattern"`
 }
 
-// Deprecated: MSC2716 was abandoned
-type ReqBatchSend struct {
-	PrevEventID id.EventID `json:"-"`
-	BatchID     id.BatchID `json:"-"`
-
-	BeeperNewMessages bool      `json:"-"`
-	BeeperMarkReadBy  id.UserID `json:"-"`
-
-	StateEventsAtStart []*event.Event `json:"state_events_at_start"`
-	Events             []*event.Event `json:"events"`
-}
-
 type ReqBeeperBatchSend struct {
 	// ForwardIfNoMessages should be set to true if the batch should be forward
 	// backfilled if there are no messages currently in the room.
@@ -542,4 +554,55 @@ type ReqKeyBackupData struct {
 type ReqReport struct {
 	Reason string `json:"reason,omitempty"`
 	Score  int    `json:"score,omitempty"`
+}
+
+type ReqGetRelations struct {
+	RelationType event.RelationType
+	EventType    event.Type
+
+	Dir     Direction
+	From    string
+	To      string
+	Limit   int
+	Recurse bool
+}
+
+func (rgr *ReqGetRelations) PathSuffix() ClientURLPath {
+	if rgr.RelationType != "" {
+		if rgr.EventType.Type != "" {
+			return ClientURLPath{rgr.RelationType, rgr.EventType.Type}
+		}
+		return ClientURLPath{rgr.RelationType}
+	}
+	return ClientURLPath{}
+}
+
+func (rgr *ReqGetRelations) Query() map[string]string {
+	query := map[string]string{}
+	if rgr.Dir != 0 {
+		query["dir"] = string(rgr.Dir)
+	}
+	if rgr.From != "" {
+		query["from"] = rgr.From
+	}
+	if rgr.To != "" {
+		query["to"] = rgr.To
+	}
+	if rgr.Limit > 0 {
+		query["limit"] = strconv.Itoa(rgr.Limit)
+	}
+	if rgr.Recurse {
+		query["recurse"] = "true"
+	}
+	return query
+}
+
+// ReqSuspend is the request body for https://github.com/matrix-org/matrix-spec-proposals/pull/4323
+type ReqSuspend struct {
+	Suspended bool `json:"suspended"`
+}
+
+// ReqLocked is the request body for https://github.com/matrix-org/matrix-spec-proposals/pull/4323
+type ReqLocked struct {
+	Locked bool `json:"locked"`
 }

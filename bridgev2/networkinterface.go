@@ -77,8 +77,28 @@ type EventSender struct {
 	ForceDMUser bool
 }
 
+func (es EventSender) MarshalZerologObject(evt *zerolog.Event) {
+	evt.Str("user_id", string(es.Sender))
+	if string(es.SenderLogin) != string(es.Sender) {
+		evt.Str("sender_login", string(es.SenderLogin))
+	}
+	if es.IsFromMe {
+		evt.Bool("is_from_me", true)
+	}
+	if es.ForceDMUser {
+		evt.Bool("force_dm_user", true)
+	}
+}
+
 type ConvertedMessage struct {
-	ReplyTo    *networkid.MessageOptionalPartID
+	ReplyTo *networkid.MessageOptionalPartID
+	// Optional additional info about the reply. This is only used when backfilling messages
+	// on Beeper, where replies may target messages that haven't been bridged yet.
+	// Standard Matrix servers can't backwards backfill, so these are never used.
+	ReplyToRoom  networkid.PortalKey
+	ReplyToUser  networkid.UserID
+	ReplyToLogin networkid.UserLoginID
+
 	ThreadRoot *networkid.MessageID
 	Parts      []*ConvertedMessagePart
 	Disappear  database.DisappearingSetting
@@ -97,11 +117,15 @@ func MergeCaption(textPart, mediaPart *ConvertedMessagePart) *ConvertedMessagePa
 		mediaPart.Content.EnsureHasHTML()
 		mediaPart.Content.Body += "\n\n" + textPart.Content.Body
 		mediaPart.Content.FormattedBody += "<br><br>" + textPart.Content.FormattedBody
+		mediaPart.Content.Mentions = mediaPart.Content.Mentions.Merge(textPart.Content.Mentions)
+		mediaPart.Content.BeeperLinkPreviews = append(mediaPart.Content.BeeperLinkPreviews, textPart.Content.BeeperLinkPreviews...)
 	} else {
 		mediaPart.Content.FileName = mediaPart.Content.Body
 		mediaPart.Content.Body = textPart.Content.Body
 		mediaPart.Content.Format = textPart.Content.Format
 		mediaPart.Content.FormattedBody = textPart.Content.FormattedBody
+		mediaPart.Content.Mentions = textPart.Content.Mentions
+		mediaPart.Content.BeeperLinkPreviews = textPart.Content.BeeperLinkPreviews
 	}
 	if metaMerger, ok := mediaPart.DBMetadata.(database.MetaMerger); ok {
 		metaMerger.CopyFrom(textPart.DBMetadata)
@@ -326,6 +350,8 @@ type NetworkGeneralCapabilities struct {
 	// to handle asynchronous message responses, this field can be set to enable
 	// automatic timeout errors in case the asynchronous response never arrives.
 	OutgoingMessageTimeouts *OutgoingTimeoutConfig
+	// Capabilities related to the provisioning API.
+	Provisioning ProvisioningCapabilities
 }
 
 // NetworkAPI is an interface representing a remote network client for a single user login.
@@ -385,6 +411,13 @@ type BackgroundSyncingNetworkAPI interface {
 	// The client should connect to the remote network, handle pending messages, and then disconnect.
 	// This call should block until the entire sync is complete and the client is disconnected.
 	ConnectBackground(ctx context.Context, params *ConnectBackgroundParams) error
+}
+
+// CredentialExportingNetworkAPI is an optional interface that networks connectors can implement to support export of
+// the credentials associated with that login. Credential type is bridge specific.
+type CredentialExportingNetworkAPI interface {
+	NetworkAPI
+	ExportCredentials(ctx context.Context) any
 }
 
 // FetchMessagesParams contains the parameters for a message history pagination request.
@@ -652,6 +685,14 @@ type RoomTopicHandlingNetworkAPI interface {
 	HandleMatrixRoomTopic(ctx context.Context, msg *MatrixRoomTopic) (bool, error)
 }
 
+type DisappearTimerChangingNetworkAPI interface {
+	NetworkAPI
+	// HandleMatrixDisappearingTimer is called when the disappearing timer of a portal room is changed.
+	// This method should update the Disappear field of the Portal with the new timer and return true
+	// if the change was successful. If the change is not successful, then the field should not be updated.
+	HandleMatrixDisappearingTimer(ctx context.Context, msg *MatrixDisappearingTimer) (bool, error)
+}
+
 type ResolveIdentifierResponse struct {
 	// Ghost is the ghost of the user that the identifier resolves to.
 	// This field should be set whenever possible. However, it is not required,
@@ -676,6 +717,9 @@ type CreateChatResponse struct {
 	// Portal and PortalInfo are not required, the caller will fetch them automatically based on PortalKey if necessary.
 	Portal     *Portal
 	PortalInfo *ChatInfo
+	// If a start DM request (CreateChatWithGhost or ResolveIdentifier) returns the DM to a different user,
+	// this field should have the user ID of said different user.
+	DMRedirectedTo networkid.UserID
 }
 
 // IdentifierResolvingNetworkAPI is an optional interface that network connectors can implement to support starting new direct chats.
@@ -708,9 +752,75 @@ type UserSearchingNetworkAPI interface {
 	SearchUsers(ctx context.Context, query string) ([]*ResolveIdentifierResponse, error)
 }
 
+type ProvisioningCapabilities struct {
+	ResolveIdentifier ResolveIdentifierCapabilities    `json:"resolve_identifier"`
+	GroupCreation     map[string]GroupTypeCapabilities `json:"group_creation"`
+}
+
+type ResolveIdentifierCapabilities struct {
+	// Can DMs be created after resolving an identifier?
+	CreateDM bool `json:"create_dm"`
+	// Can users be looked up by phone number?
+	LookupPhone bool `json:"lookup_phone"`
+	// Can users be looked up by email address?
+	LookupEmail bool `json:"lookup_email"`
+	// Can users be looked up by network-specific username?
+	LookupUsername bool `json:"lookup_username"`
+	// Can any phone number be contacted without having to validate it via lookup first?
+	AnyPhone bool `json:"any_phone"`
+	// Can a contact list be retrieved from the bridge?
+	ContactList bool `json:"contact_list"`
+	// Can users be searched by name on the remote network?
+	Search bool `json:"search"`
+}
+
+type GroupTypeCapabilities struct {
+	TypeDescription string `json:"type_description"`
+
+	Name         GroupFieldCapability `json:"name"`
+	Username     GroupFieldCapability `json:"username"`
+	Avatar       GroupFieldCapability `json:"avatar"`
+	Topic        GroupFieldCapability `json:"topic"`
+	Disappear    GroupFieldCapability `json:"disappear"`
+	Participants GroupFieldCapability `json:"participants"`
+	Parent       GroupFieldCapability `json:"parent"`
+}
+
+type GroupFieldCapability struct {
+	// Is setting this field allowed at all in the create request?
+	// Even if false, the network connector should attempt to set the metadata after group creation,
+	// as the allowed flag can't be enforced properly when creating a group for an existing Matrix room.
+	Allowed bool `json:"allowed"`
+	// Is setting this field mandatory for the creation to succeed?
+	Required bool `json:"required,omitempty"`
+	// The minimum/maximum length of the field, if applicable.
+	// For members, length means the number of members excluding the creator.
+	MinLength int `json:"min_length,omitempty"`
+	MaxLength int `json:"max_length,omitempty"`
+
+	// Only for the disappear field: allowed disappearing settings
+	DisappearSettings *event.DisappearingTimerCapability `json:"settings,omitempty"`
+}
+
+type GroupCreateParams struct {
+	Type string `json:"type"`
+
+	Username     string               `json:"username"`
+	Participants []networkid.UserID   `json:"participants"`
+	Parent       *networkid.PortalKey `json:"parent"`
+
+	Name      *event.RoomNameEventContent    `json:"name"`
+	Avatar    *event.RoomAvatarEventContent  `json:"avatar"`
+	Topic     *event.TopicEventContent       `json:"topic"`
+	Disappear *event.BeeperDisappearingTimer `json:"disappear"`
+
+	// An existing room ID to bridge to. If unset, a new room will be created.
+	RoomID id.RoomID `json:"room_id"`
+}
+
 type GroupCreatingNetworkAPI interface {
 	IdentifierResolvingNetworkAPI
-	CreateGroup(ctx context.Context, name string, users ...networkid.UserID) (*CreateChatResponse, error)
+	CreateGroup(ctx context.Context, params *GroupCreateParams) (*CreateChatResponse, error)
 }
 
 type MembershipChangeType struct {
@@ -1117,6 +1227,11 @@ type RemoteReadReceipt interface {
 	GetReadUpTo() time.Time
 }
 
+type RemoteReadReceiptWithStreamOrder interface {
+	RemoteReadReceipt
+	GetReadUpToStreamOrder() int64
+}
+
 type RemoteDeliveryReceipt interface {
 	RemoteEvent
 	GetReceiptTargets() []networkid.MessageID
@@ -1152,6 +1267,7 @@ type OrigSender struct {
 	RequiresDisambiguation bool
 	DisambiguatedName      string
 	FormattedName          string
+	PerMessageProfile      event.BeeperPerMessageProfile
 
 	event.MemberEventContent
 }
@@ -1230,6 +1346,7 @@ type MatrixRoomMeta[ContentType any] struct {
 type MatrixRoomName = MatrixRoomMeta[*event.RoomNameEventContent]
 type MatrixRoomAvatar = MatrixRoomMeta[*event.RoomAvatarEventContent]
 type MatrixRoomTopic = MatrixRoomMeta[*event.TopicEventContent]
+type MatrixDisappearingTimer = MatrixRoomMeta[*event.BeeperDisappearingTimer]
 
 type MatrixReadReceipt struct {
 	Portal *Portal

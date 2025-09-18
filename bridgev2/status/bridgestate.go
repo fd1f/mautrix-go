@@ -22,6 +22,8 @@ import (
 	"go.mau.fi/util/ptr"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -78,6 +80,7 @@ type BridgeStateUserAction string
 const (
 	UserActionOpenNative BridgeStateUserAction = "OPEN_NATIVE"
 	UserActionRelogin    BridgeStateUserAction = "RELOGIN"
+	UserActionRestart    BridgeStateUserAction = "RESTART"
 )
 
 type RemoteProfile struct {
@@ -86,6 +89,8 @@ type RemoteProfile struct {
 	Username string              `json:"username,omitempty"`
 	Name     string              `json:"name,omitempty"`
 	Avatar   id.ContentURIString `json:"avatar,omitempty"`
+
+	AvatarFile *event.EncryptedFileInfo `json:"avatar_file,omitempty"`
 }
 
 func coalesce[T ~string](a, b T) T {
@@ -101,11 +106,14 @@ func (rp *RemoteProfile) Merge(other RemoteProfile) RemoteProfile {
 	other.Username = coalesce(rp.Username, other.Username)
 	other.Name = coalesce(rp.Name, other.Name)
 	other.Avatar = coalesce(rp.Avatar, other.Avatar)
+	if rp.AvatarFile != nil {
+		other.AvatarFile = rp.AvatarFile
+	}
 	return other
 }
 
 func (rp *RemoteProfile) IsEmpty() bool {
-	return rp == nil || (rp.Phone == "" && rp.Email == "" && rp.Username == "" && rp.Name == "" && rp.Avatar == "")
+	return rp == nil || (rp.Phone == "" && rp.Email == "" && rp.Username == "" && rp.Name == "" && rp.Avatar == "" && rp.AvatarFile == nil)
 }
 
 type BridgeState struct {
@@ -119,10 +127,10 @@ type BridgeState struct {
 
 	UserAction BridgeStateUserAction `json:"user_action,omitempty"`
 
-	UserID        id.UserID      `json:"user_id,omitempty"`
-	RemoteID      string         `json:"remote_id,omitempty"`
-	RemoteName    string         `json:"remote_name,omitempty"`
-	RemoteProfile *RemoteProfile `json:"remote_profile,omitempty"`
+	UserID        id.UserID             `json:"user_id,omitempty"`
+	RemoteID      networkid.UserLoginID `json:"remote_id,omitempty"`
+	RemoteName    string                `json:"remote_name,omitempty"`
+	RemoteProfile *RemoteProfile        `json:"remote_profile,omitempty"`
 
 	Reason string                 `json:"reason,omitempty"`
 	Info   map[string]interface{} `json:"info,omitempty"`

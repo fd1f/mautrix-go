@@ -25,6 +25,9 @@ bridge:
     # These contain the same data that can be posted to an external HTTP server using homeserver -> status_endpoint.
     # Allowed values: none, errors, all
     bridge_status_notices: errors
+    # How long after an unknown error should the bridge attempt a full reconnect?
+    # Must be at least 1 minute. The bridge will add an extra ±20% jitter to this value.
+    unknown_error_auto_reconnect: null
 
     # Should leaving Matrix rooms be bridged as leaving groups on the remote network?
     bridge_matrix_leave: false
@@ -40,6 +43,9 @@ bridge:
     mute_only_on_create: true
     # Should the bridge check the db to ensure that incoming events haven't been handled before
     deduplicate_matrix_messages: false
+    # Should cross-room reply metadata be bridged?
+    # Most Matrix clients don't support this and servers may reject such messages too.
+    cross_room_replies: false
 
     # What should be done to portal rooms when a user logs out or is logged out?
     # Permitted values:
@@ -241,10 +247,8 @@ analytics:
 
 # Settings for provisioning API
 provisioning:
-    # Prefix for the provisioning API paths.
-    prefix: /_matrix/provision
     # Shared secret for authentication. If set to "generate" or null, a random secret will be generated,
-    # or if set to "disable", the provisioning API will be disabled.
+    # or if set to "disable", the provisioning API will be disabled. Must be at least 16 characters.
     shared_secret: generate
     # Whether to allow provisioning API requests to be authed using Matrix access tokens.
     # This follows the same rules as double puppeting to determine which server to contact to check the token,
@@ -252,6 +256,9 @@ provisioning:
     allow_matrix_auth: true
     # Enable debug API at /debug with provisioning authentication.
     debug_endpoints: false
+    # Enable session transfers between bridges. Note that this only validates Matrix or shared secret
+    # auth before passing live network client credentials down in the response.
+    enable_session_transfers: false
 
 # Some networks require publicly accessible media download links (e.g. for user avatars when using Discord webhooks).
 # These settings control whether the bridge will provide such public media access.

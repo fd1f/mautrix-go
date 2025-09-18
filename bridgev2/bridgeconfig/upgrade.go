@@ -32,12 +32,14 @@ func doUpgrade(helper up.Helper) {
 	helper.Copy(up.Bool, "bridge", "resend_bridge_info")
 	helper.Copy(up.Bool, "bridge", "no_bridge_info_state_key")
 	helper.Copy(up.Str|up.Null, "bridge", "bridge_status_notices")
+	helper.Copy(up.Str|up.Int|up.Null, "bridge", "unknown_error_auto_reconnect")
 	helper.Copy(up.Bool, "bridge", "bridge_matrix_leave")
 	helper.Copy(up.Bool, "bridge", "bridge_notices")
 	helper.Copy(up.Bool, "bridge", "tag_only_on_create")
 	helper.Copy(up.List, "bridge", "only_bridge_tags")
 	helper.Copy(up.Bool, "bridge", "mute_only_on_create")
 	helper.Copy(up.Bool, "bridge", "deduplicate_matrix_messages")
+	helper.Copy(up.Bool, "bridge", "cross_room_replies")
 	helper.Copy(up.Bool, "bridge", "cleanup_on_logout", "enabled")
 	helper.Copy(up.Str, "bridge", "cleanup_on_logout", "manual", "private")
 	helper.Copy(up.Str, "bridge", "cleanup_on_logout", "manual", "relayed")
@@ -101,7 +103,6 @@ func doUpgrade(helper up.Helper) {
 	helper.Copy(up.Str|up.Null, "analytics", "url")
 	helper.Copy(up.Str|up.Null, "analytics", "user_id")
 
-	helper.Copy(up.Str, "provisioning", "prefix")
 	if secret, ok := helper.Get(up.Str, "provisioning", "shared_secret"); !ok || secret == "generate" {
 		sharedSecret := random.String(64)
 		helper.Set(up.Str, sharedSecret, "provisioning", "shared_secret")
@@ -109,6 +110,7 @@ func doUpgrade(helper up.Helper) {
 		helper.Copy(up.Str, "provisioning", "shared_secret")
 	}
 	helper.Copy(up.Bool, "provisioning", "debug_endpoints")
+	helper.Copy(up.Bool, "provisioning", "enable_session_transfers")
 
 	helper.Copy(up.Bool, "direct_media", "enabled")
 	helper.Copy(up.Str|up.Null, "direct_media", "media_id_prefix")

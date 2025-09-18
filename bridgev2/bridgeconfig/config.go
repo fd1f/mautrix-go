@@ -7,6 +7,8 @@
 package bridgeconfig
 
 import (
+	"time"
+
 	"go.mau.fi/util/dbutil"
 	"go.mau.fi/zeroconfig"
 	"gopkg.in/yaml.v3"
@@ -66,12 +68,14 @@ type BridgeConfig struct {
 	ResendBridgeInfo          bool             `yaml:"resend_bridge_info"`
 	NoBridgeInfoStateKey      bool             `yaml:"no_bridge_info_state_key"`
 	BridgeStatusNotices       string           `yaml:"bridge_status_notices"`
+	UnknownErrorAutoReconnect time.Duration    `yaml:"unknown_error_auto_reconnect"`
 	BridgeMatrixLeave         bool             `yaml:"bridge_matrix_leave"`
 	BridgeNotices             bool             `yaml:"bridge_notices"`
 	TagOnlyOnCreate           bool             `yaml:"tag_only_on_create"`
 	OnlyBridgeTags            []event.RoomTag  `yaml:"only_bridge_tags"`
 	MuteOnlyOnCreate          bool             `yaml:"mute_only_on_create"`
 	DeduplicateMatrixMessages bool             `yaml:"deduplicate_matrix_messages"`
+	CrossRoomReplies          bool             `yaml:"cross_room_replies"`
 	OutgoingMessageReID       bool             `yaml:"outgoing_message_re_id"`
 	CleanupOnLogout           CleanupOnLogouts `yaml:"cleanup_on_logout"`
 	Relay                     RelayConfig      `yaml:"relay"`
@@ -95,9 +99,9 @@ type AnalyticsConfig struct {
 }
 
 type ProvisioningConfig struct {
-	Prefix         string `yaml:"prefix"`
-	SharedSecret   string `yaml:"shared_secret"`
-	DebugEndpoints bool   `yaml:"debug_endpoints"`
+	SharedSecret           string `yaml:"shared_secret"`
+	DebugEndpoints         bool   `yaml:"debug_endpoints"`
+	EnableSessionTransfers bool   `yaml:"enable_session_transfers"`
 }
 
 type DirectMediaConfig struct {

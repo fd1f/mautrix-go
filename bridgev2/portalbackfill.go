@@ -323,8 +323,13 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 	if len(msg.Parts) == 0 {
 		return
 	}
-	intent := portal.GetIntentFor(ctx, msg.Sender, source, RemoteEventMessage)
-	replyTo, threadRoot, prevThreadEvent := portal.getRelationMeta(ctx, msg.ID, msg.ReplyTo, msg.ThreadRoot, true)
+	intent, ok := portal.GetIntentFor(ctx, msg.Sender, source, RemoteEventMessage)
+	if !ok {
+		return
+	}
+	replyTo, threadRoot, prevThreadEvent := portal.getRelationMeta(
+		ctx, msg.ID, msg.ConvertedMessage, true,
+	)
 	if threadRoot != nil && out.PrevThreadEvents[*msg.ThreadRoot] != "" {
 		prevThreadEvent.MXID = out.PrevThreadEvents[*msg.ThreadRoot]
 	}
@@ -333,7 +338,8 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 	var firstPart *database.Message
 	for i, part := range msg.Parts {
 		partIDs = append(partIDs, part.ID)
-		portal.applyRelationMeta(part.Content, replyTo, threadRoot, prevThreadEvent)
+		portal.applyRelationMeta(ctx, part.Content, replyTo, threadRoot, prevThreadEvent)
+		part.Content.BeeperDisappearingTimer = msg.Disappear.ToEventContent()
 		evtID := portal.Bridge.Matrix.GenerateDeterministicEventID(portal.MXID, portal.PortalKey, msg.ID, part.ID)
 		dbMessage := &database.Message{
 			ID:               msg.ID,
@@ -374,8 +380,8 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 			prevThreadEvent.MXID = evtID
 			out.PrevThreadEvents[*msg.ThreadRoot] = evtID
 		}
-		if msg.Disappear.Type != database.DisappearingTypeNone {
-			if msg.Disappear.Type == database.DisappearingTypeAfterSend && msg.Disappear.DisappearAt.IsZero() {
+		if msg.Disappear.Type != event.DisappearingTypeNone {
+			if msg.Disappear.Type == event.DisappearingTypeAfterSend && msg.Disappear.DisappearAt.IsZero() {
 				msg.Disappear.DisappearAt = msg.Timestamp.Add(msg.Disappear.Timer)
 			}
 			out.Disappear = append(out.Disappear, &database.DisappearingMessage{
@@ -387,7 +393,10 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 	}
 	slices.Sort(partIDs)
 	for _, reaction := range msg.Reactions {
-		reactionIntent := portal.GetIntentFor(ctx, reaction.Sender, source, RemoteEventReactionRemove)
+		reactionIntent, ok := portal.GetIntentFor(ctx, reaction.Sender, source, RemoteEventReactionRemove)
+		if !ok {
+			continue
+		}
 		if reaction.TargetPart == nil {
 			reaction.TargetPart = &partIDs[0]
 		}
@@ -513,8 +522,11 @@ func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages
 func (portal *Portal) sendLegacyBackfill(ctx context.Context, source *UserLogin, messages []*BackfillMessage, markRead bool) {
 	var lastPart id.EventID
 	for _, msg := range messages {
-		intent := portal.GetIntentFor(ctx, msg.Sender, source, RemoteEventMessage)
-		dbMessages := portal.sendConvertedMessage(ctx, msg.ID, intent, msg.Sender.Sender, msg.ConvertedMessage, msg.Timestamp, msg.StreamOrder, func(z *zerolog.Event) *zerolog.Event {
+		intent, ok := portal.GetIntentFor(ctx, msg.Sender, source, RemoteEventMessage)
+		if !ok {
+			continue
+		}
+		dbMessages, _ := portal.sendConvertedMessage(ctx, msg.ID, intent, msg.Sender.Sender, msg.ConvertedMessage, msg.Timestamp, msg.StreamOrder, func(z *zerolog.Event) *zerolog.Event {
 			return z.
 				Str("message_id", string(msg.ID)).
 				Any("sender_id", msg.Sender).
@@ -523,7 +535,10 @@ func (portal *Portal) sendLegacyBackfill(ctx context.Context, source *UserLogin,
 		if len(dbMessages) > 0 {
 			lastPart = dbMessages[len(dbMessages)-1].MXID
 			for _, reaction := range msg.Reactions {
-				reactionIntent := portal.GetIntentFor(ctx, reaction.Sender, source, RemoteEventReaction)
+				reactionIntent, ok := portal.GetIntentFor(ctx, reaction.Sender, source, RemoteEventReaction)
+				if !ok {
+					continue
+				}
 				targetPart := dbMessages[0]
 				if reaction.TargetPart != nil {
 					targetPartIdx := slices.IndexFunc(dbMessages, func(dbMsg *database.Message) bool {

@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Tulir Asokan
+// Copyright (c) 2025 Tulir Asokan
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -17,17 +17,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/rs/xid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
+	"go.mau.fi/util/exerrors"
+	"go.mau.fi/util/exhttp"
 	"go.mau.fi/util/exstrings"
 	"go.mau.fi/util/jsontime"
+	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/requestlog"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/provisionutil"
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
@@ -39,7 +42,7 @@ type matrixAuthCacheEntry struct {
 }
 
 type ProvisioningAPI struct {
-	Router *mux.Router
+	Router *http.ServeMux
 
 	br  *Connector
 	log zerolog.Logger
@@ -52,6 +55,11 @@ type ProvisioningAPI struct {
 
 	matrixAuthCache     map[string]matrixAuthCacheEntry
 	matrixAuthCacheLock sync.Mutex
+
+	// Set for a given login once credentials have been exported, once in this state the finish
+	// API is available which will call logout on the client in question.
+	sessionTransfers     map[networkid.UserLoginID]struct{}
+	sessionTransfersLock sync.Mutex
 
 	// GetAuthFromRequest is a custom function for getting the auth token from
 	// the request if the Authorization header is not present.
@@ -85,12 +93,12 @@ func (prov *ProvisioningAPI) GetUser(r *http.Request) *bridgev2.User {
 	return r.Context().Value(provisioningUserKey).(*bridgev2.User)
 }
 
-func (prov *ProvisioningAPI) GetRouter() *mux.Router {
+func (prov *ProvisioningAPI) GetRouter() *http.ServeMux {
 	return prov.Router
 }
 
 type IProvisioningAPI interface {
-	GetRouter() *mux.Router
+	GetRouter() *http.ServeMux
 	GetUser(r *http.Request) *bridgev2.User
 }
 
@@ -101,6 +109,7 @@ func (br *Connector) GetProvisioning() IProvisioningAPI {
 func (prov *ProvisioningAPI) Init() {
 	prov.matrixAuthCache = make(map[string]matrixAuthCacheEntry)
 	prov.logins = make(map[string]*ProvLogin)
+	prov.sessionTransfers = make(map[networkid.UserLoginID]struct{})
 	prov.net = prov.br.Bridge.Network
 	prov.log = prov.br.Log.With().Str("component", "provisioning").Logger()
 	prov.fedClient = federation.NewClient("", nil, nil)
@@ -109,54 +118,57 @@ func (prov *ProvisioningAPI) Init() {
 	tp.Dialer.Timeout = 10 * time.Second
 	tp.Transport.ResponseHeaderTimeout = 10 * time.Second
 	tp.Transport.TLSHandshakeTimeout = 10 * time.Second
-	prov.Router = prov.br.AS.Router.PathPrefix(prov.br.Config.Provisioning.Prefix).Subrouter()
-	prov.Router.Use(hlog.NewHandler(prov.log))
-	prov.Router.Use(hlog.RequestIDHandler("request_id", "Request-Id"))
-	prov.Router.Use(corsMiddleware)
-	prov.Router.Use(requestlog.AccessLogger(false))
-	prov.Router.Use(prov.AuthMiddleware)
-	prov.Router.Path("/v3/whoami").Methods(http.MethodGet, http.MethodOptions).HandlerFunc(prov.GetWhoami)
-	prov.Router.Path("/v3/login/flows").Methods(http.MethodGet, http.MethodOptions).HandlerFunc(prov.GetLoginFlows)
-	prov.Router.Path("/v3/login/start/{flowID}").Methods(http.MethodPost, http.MethodOptions).HandlerFunc(prov.PostLoginStart)
-	prov.Router.Path("/v3/login/step/{loginProcessID}/{stepID}/{stepType:user_input|cookies}").Methods(http.MethodPost, http.MethodOptions).HandlerFunc(prov.PostLoginSubmitInput)
-	prov.Router.Path("/v3/login/step/{loginProcessID}/{stepID}/{stepType:display_and_wait}").Methods(http.MethodPost, http.MethodOptions).HandlerFunc(prov.PostLoginWait)
-	prov.Router.Path("/v3/logout/{loginID}").Methods(http.MethodPost, http.MethodOptions).HandlerFunc(prov.PostLogout)
-	prov.Router.Path("/v3/logins").Methods(http.MethodGet, http.MethodOptions).HandlerFunc(prov.GetLogins)
-	prov.Router.Path("/v3/contacts").Methods(http.MethodGet, http.MethodOptions).HandlerFunc(prov.GetContactList)
-	prov.Router.Path("/v3/search_users").Methods(http.MethodPost, http.MethodOptions).HandlerFunc(prov.PostSearchUsers)
-	prov.Router.Path("/v3/resolve_identifier/{identifier}").Methods(http.MethodGet, http.MethodOptions).HandlerFunc(prov.GetResolveIdentifier)
-	prov.Router.Path("/v3/create_dm/{identifier}").Methods(http.MethodPost, http.MethodOptions).HandlerFunc(prov.PostCreateDM)
-	prov.Router.Path("/v3/create_group").Methods(http.MethodPost, http.MethodOptions).HandlerFunc(prov.PostCreateGroup)
+	prov.Router = http.NewServeMux()
+	prov.Router.HandleFunc("GET /v3/whoami", prov.GetWhoami)
+	prov.Router.HandleFunc("GET /v3/capabilities", prov.GetCapabilities)
+	prov.Router.HandleFunc("GET /v3/login/flows", prov.GetLoginFlows)
+	prov.Router.HandleFunc("POST /v3/login/start/{flowID}", prov.PostLoginStart)
+	prov.Router.HandleFunc("POST /v3/login/step/{loginProcessID}/{stepID}/{stepType}", prov.PostLoginStep)
+	prov.Router.HandleFunc("POST /v3/logout/{loginID}", prov.PostLogout)
+	prov.Router.HandleFunc("GET /v3/logins", prov.GetLogins)
+	prov.Router.HandleFunc("GET /v3/contacts", prov.GetContactList)
+	prov.Router.HandleFunc("POST /v3/search_users", prov.PostSearchUsers)
+	prov.Router.HandleFunc("GET /v3/resolve_identifier/{identifier}", prov.GetResolveIdentifier)
+	prov.Router.HandleFunc("POST /v3/create_dm/{identifier}", prov.PostCreateDM)
+	prov.Router.HandleFunc("POST /v3/create_group/{type}", prov.PostCreateGroup)
+
+	if prov.br.Config.Provisioning.EnableSessionTransfers {
+		prov.log.Debug().Msg("Enabling session transfer API")
+		prov.Router.HandleFunc("POST /v3/session_transfer/init", prov.PostInitSessionTransfer)
+		prov.Router.HandleFunc("POST /v3/session_transfer/finish", prov.PostFinishSessionTransfer)
+	}
 
 	if prov.br.Config.Provisioning.DebugEndpoints {
 		prov.log.Debug().Msg("Enabling debug API at /debug")
-		r := prov.br.AS.Router.PathPrefix("/debug").Subrouter()
-		r.Use(prov.DebugAuthMiddleware)
-		r.HandleFunc("/pprof/cmdline", pprof.Cmdline).Methods(http.MethodGet)
-		r.HandleFunc("/pprof/profile", pprof.Profile).Methods(http.MethodGet)
-		r.HandleFunc("/pprof/symbol", pprof.Symbol).Methods(http.MethodGet)
-		r.HandleFunc("/pprof/trace", pprof.Trace).Methods(http.MethodGet)
-		r.PathPrefix("/pprof/").HandlerFunc(pprof.Index)
+		debugRouter := http.NewServeMux()
+		debugRouter.HandleFunc("GET /pprof/cmdline", pprof.Cmdline)
+		debugRouter.HandleFunc("GET /pprof/profile", pprof.Profile)
+		debugRouter.HandleFunc("GET /pprof/symbol", pprof.Symbol)
+		debugRouter.HandleFunc("GET /pprof/trace", pprof.Trace)
+		debugRouter.HandleFunc("/pprof/", pprof.Index)
+		prov.br.AS.Router.Handle("/debug/", exhttp.ApplyMiddleware(
+			debugRouter,
+			exhttp.StripPrefix("/debug"),
+			hlog.NewHandler(prov.br.Log.With().Str("component", "debug api").Logger()),
+			requestlog.AccessLogger(requestlog.Options{TrustXForwardedFor: true}),
+			prov.DebugAuthMiddleware,
+		))
 	}
-}
 
-func corsMiddleware(handler http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "X-Requested-With, Content-Type, Authorization")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		handler.ServeHTTP(w, r)
-	})
-}
-
-func jsonResponse(w http.ResponseWriter, status int, response any) {
-	w.Header().Add("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(response)
+	errorBodies := exhttp.ErrorBodies{
+		NotFound:         exerrors.Must(ptr.Ptr(mautrix.MUnrecognized.WithMessage("Unrecognized endpoint")).MarshalJSON()),
+		MethodNotAllowed: exerrors.Must(ptr.Ptr(mautrix.MUnrecognized.WithMessage("Invalid method for endpoint")).MarshalJSON()),
+	}
+	prov.br.AS.Router.Handle("/_matrix/provision/", exhttp.ApplyMiddleware(
+		prov.Router,
+		exhttp.StripPrefix("/_matrix/provision"),
+		hlog.NewHandler(prov.log),
+		hlog.RequestIDHandler("request_id", "Request-Id"),
+		exhttp.CORSMiddleware,
+		requestlog.AccessLogger(requestlog.Options{TrustXForwardedFor: true}),
+		exhttp.HandleErrors(errorBodies),
+		prov.AuthMiddleware,
+	))
 }
 
 func (prov *ProvisioningAPI) checkMatrixAuth(ctx context.Context, userID id.UserID, token string) error {
@@ -200,19 +212,21 @@ func (prov *ProvisioningAPI) checkFederatedMatrixAuth(ctx context.Context, userI
 	}
 }
 
+func disabledAuth(w http.ResponseWriter, r *http.Request) {
+	mautrix.MForbidden.WithMessage("Provisioning API is disabled").Write(w)
+}
+
 func (prov *ProvisioningAPI) DebugAuthMiddleware(h http.Handler) http.Handler {
+	secret := prov.br.Config.Provisioning.SharedSecret
+	if len(secret) < 16 {
+		return http.HandlerFunc(disabledAuth)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if auth == "" {
-			jsonResponse(w, http.StatusUnauthorized, &mautrix.RespError{
-				Err:     "Missing auth token",
-				ErrCode: mautrix.MMissingToken.ErrCode,
-			})
-		} else if !exstrings.ConstantTimeEqual(auth, prov.br.Config.Provisioning.SharedSecret) {
-			jsonResponse(w, http.StatusUnauthorized, &mautrix.RespError{
-				Err:     "Invalid auth token",
-				ErrCode: mautrix.MUnknownToken.ErrCode,
-			})
+			mautrix.MMissingToken.WithMessage("Missing auth token").Write(w)
+		} else if !exstrings.ConstantTimeEqual(auth, secret) {
+			mautrix.MUnknownToken.WithMessage("Invalid auth token").Write(w)
 		} else {
 			h.ServeHTTP(w, r)
 		}
@@ -220,23 +234,24 @@ func (prov *ProvisioningAPI) DebugAuthMiddleware(h http.Handler) http.Handler {
 }
 
 func (prov *ProvisioningAPI) AuthMiddleware(h http.Handler) http.Handler {
+	secret := prov.br.Config.Provisioning.SharedSecret
+	if len(secret) < 16 {
+		return http.HandlerFunc(disabledAuth)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if auth == "" && prov.GetAuthFromRequest != nil {
 			auth = prov.GetAuthFromRequest(r)
 		}
 		if auth == "" {
-			jsonResponse(w, http.StatusUnauthorized, &mautrix.RespError{
-				Err:     "Missing auth token",
-				ErrCode: mautrix.MMissingToken.ErrCode,
-			})
+			mautrix.MMissingToken.WithMessage("Missing auth token").Write(w)
 			return
 		}
 		userID := id.UserID(r.URL.Query().Get("user_id"))
 		if userID == "" && prov.GetUserIDFromRequest != nil {
 			userID = prov.GetUserIDFromRequest(r)
 		}
-		if !exstrings.ConstantTimeEqual(auth, prov.br.Config.Provisioning.SharedSecret) {
+		if !exstrings.ConstantTimeEqual(auth, secret) {
 			var err error
 			if strings.HasPrefix(auth, "openid:") {
 				err = prov.checkFederatedMatrixAuth(r.Context(), userID, strings.TrimPrefix(auth, "openid:"))
@@ -246,75 +261,25 @@ func (prov *ProvisioningAPI) AuthMiddleware(h http.Handler) http.Handler {
 			if err != nil {
 				zerolog.Ctx(r.Context()).Warn().Err(err).
 					Msg("Provisioning API request contained invalid auth")
-				jsonResponse(w, http.StatusUnauthorized, &mautrix.RespError{
-					Err:     "Invalid auth token",
-					ErrCode: mautrix.MUnknownToken.ErrCode,
-				})
+				mautrix.MUnknownToken.WithMessage("Invalid auth token").Write(w)
 				return
 			}
 		}
 		user, err := prov.br.Bridge.GetUserByMXID(r.Context(), userID)
 		if err != nil {
 			zerolog.Ctx(r.Context()).Err(err).Msg("Failed to get user")
-			jsonResponse(w, http.StatusInternalServerError, &mautrix.RespError{
-				Err:     "Failed to get user",
-				ErrCode: "M_UNKNOWN",
-			})
+			mautrix.MUnknown.WithMessage("Failed to get user").Write(w)
 			return
 		}
 		// TODO handle user being nil?
 		// TODO per-endpoint permissions?
 		if !user.Permissions.Login {
-			jsonResponse(w, http.StatusForbidden, &mautrix.RespError{
-				Err:     "User does not have login permissions",
-				ErrCode: mautrix.MForbidden.ErrCode,
-			})
+			mautrix.MForbidden.WithMessage("User does not have login permissions").Write(w)
 			return
 		}
 
 		ctx := context.WithValue(r.Context(), ProvisioningKeyRequest, r)
 		ctx = context.WithValue(ctx, provisioningUserKey, user)
-		if loginID, ok := mux.Vars(r)["loginProcessID"]; ok {
-			prov.loginsLock.RLock()
-			login, ok := prov.logins[loginID]
-			prov.loginsLock.RUnlock()
-			if !ok {
-				zerolog.Ctx(r.Context()).Warn().Str("login_id", loginID).Msg("Login not found")
-				jsonResponse(w, http.StatusNotFound, &mautrix.RespError{
-					Err:     "Login not found",
-					ErrCode: mautrix.MNotFound.ErrCode,
-				})
-				return
-			}
-			login.Lock.Lock()
-			// This will only unlock after the handler runs
-			defer login.Lock.Unlock()
-			stepID := mux.Vars(r)["stepID"]
-			if login.NextStep.StepID != stepID {
-				zerolog.Ctx(r.Context()).Warn().
-					Str("request_step_id", stepID).
-					Str("expected_step_id", login.NextStep.StepID).
-					Msg("Step ID does not match")
-				jsonResponse(w, http.StatusBadRequest, &mautrix.RespError{
-					Err:     "Step ID does not match",
-					ErrCode: mautrix.MBadState.ErrCode,
-				})
-				return
-			}
-			stepType := mux.Vars(r)["stepType"]
-			if login.NextStep.Type != bridgev2.LoginStepType(stepType) {
-				zerolog.Ctx(r.Context()).Warn().
-					Str("request_step_type", stepType).
-					Str("expected_step_type", string(login.NextStep.Type)).
-					Msg("Step type does not match")
-				jsonResponse(w, http.StatusBadRequest, &mautrix.RespError{
-					Err:     "Step type does not match",
-					ErrCode: mautrix.MBadState.ErrCode,
-				})
-				return
-			}
-			ctx = context.WithValue(ctx, provisioningLoginProcessKey, login)
-		}
 		h.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -379,7 +344,7 @@ func (prov *ProvisioningAPI) GetWhoami(w http.ResponseWriter, r *http.Request) {
 			SpaceRoom: login.SpaceRoom,
 		}
 	}
-	jsonResponse(w, http.StatusOK, resp)
+	exhttp.WriteJSONResponse(w, http.StatusOK, resp)
 }
 
 type RespLoginFlows struct {
@@ -392,10 +357,16 @@ type RespSubmitLogin struct {
 }
 
 func (prov *ProvisioningAPI) GetLoginFlows(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, &RespLoginFlows{
+	exhttp.WriteJSONResponse(w, http.StatusOK, &RespLoginFlows{
 		Flows: prov.net.GetLoginFlows(),
 	})
 }
+
+func (prov *ProvisioningAPI) GetCapabilities(w http.ResponseWriter, r *http.Request) {
+	exhttp.WriteJSONResponse(w, http.StatusOK, &prov.net.GetCapabilities().Provisioning)
+}
+
+var ErrNilStep = errors.New("bridge returned nil step with no error")
 
 func (prov *ProvisioningAPI) PostLoginStart(w http.ResponseWriter, r *http.Request) {
 	overrideLogin, failed := prov.GetExplicitLoginForRequest(w, r)
@@ -405,7 +376,7 @@ func (prov *ProvisioningAPI) PostLoginStart(w http.ResponseWriter, r *http.Reque
 	login, err := prov.net.CreateLogin(
 		r.Context(),
 		prov.GetUser(r),
-		mux.Vars(r)["flowID"],
+		r.PathValue("flowID"),
 	)
 	if err != nil {
 		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to create login process")
@@ -418,6 +389,9 @@ func (prov *ProvisioningAPI) PostLoginStart(w http.ResponseWriter, r *http.Reque
 		firstStep, err = overridable.StartWithOverride(r.Context(), overrideLogin)
 	} else {
 		firstStep, err = login.Start(r.Context())
+	}
+	if err == nil && firstStep == nil {
+		err = ErrNilStep
 	}
 	if err != nil {
 		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to start login")
@@ -433,7 +407,7 @@ func (prov *ProvisioningAPI) PostLoginStart(w http.ResponseWriter, r *http.Reque
 		Override: overrideLogin,
 	}
 	prov.loginsLock.Unlock()
-	jsonResponse(w, http.StatusOK, &RespSubmitLogin{LoginID: loginID, LoginStep: firstStep})
+	exhttp.WriteJSONResponse(w, http.StatusOK, &RespSubmitLogin{LoginID: loginID, LoginStep: firstStep})
 }
 
 func (prov *ProvisioningAPI) handleCompleteStep(ctx context.Context, login *ProvLogin, step *bridgev2.LoginStep) {
@@ -450,15 +424,58 @@ func (prov *ProvisioningAPI) handleCompleteStep(ctx context.Context, login *Prov
 	}, bridgev2.DeleteOpts{LogoutRemote: true})
 }
 
+func (prov *ProvisioningAPI) PostLoginStep(w http.ResponseWriter, r *http.Request) {
+	loginID := r.PathValue("loginProcessID")
+	prov.loginsLock.RLock()
+	login, ok := prov.logins[loginID]
+	prov.loginsLock.RUnlock()
+	if !ok {
+		zerolog.Ctx(r.Context()).Warn().Str("login_id", loginID).Msg("Login not found")
+		mautrix.MNotFound.WithMessage("Login not found").Write(w)
+		return
+	}
+	login.Lock.Lock()
+	// This will only unlock after the handler runs
+	defer login.Lock.Unlock()
+	stepID := r.PathValue("stepID")
+	if login.NextStep.StepID != stepID {
+		zerolog.Ctx(r.Context()).Warn().
+			Str("request_step_id", stepID).
+			Str("expected_step_id", login.NextStep.StepID).
+			Msg("Step ID does not match")
+		mautrix.MBadState.WithMessage("Step ID does not match").Write(w)
+		return
+	}
+	stepType := r.PathValue("stepType")
+	if login.NextStep.Type != bridgev2.LoginStepType(stepType) {
+		zerolog.Ctx(r.Context()).Warn().
+			Str("request_step_type", stepType).
+			Str("expected_step_type", string(login.NextStep.Type)).
+			Msg("Step type does not match")
+		mautrix.MBadState.WithMessage("Step type does not match").Write(w)
+		return
+	}
+	ctx := context.WithValue(r.Context(), provisioningLoginProcessKey, login)
+	r = r.WithContext(ctx)
+	switch bridgev2.LoginStepType(r.PathValue("stepType")) {
+	case bridgev2.LoginStepTypeUserInput, bridgev2.LoginStepTypeCookies:
+		prov.PostLoginSubmitInput(w, r)
+	case bridgev2.LoginStepTypeDisplayAndWait:
+		prov.PostLoginWait(w, r)
+	case bridgev2.LoginStepTypeComplete:
+		fallthrough
+	default:
+		// This is probably impossible because of the above check that the next step type matches the request.
+		mautrix.MUnrecognized.WithMessage("Invalid step type %q", r.PathValue("stepType")).Write(w)
+	}
+}
+
 func (prov *ProvisioningAPI) PostLoginSubmitInput(w http.ResponseWriter, r *http.Request) {
 	var params map[string]string
 	err := json.NewDecoder(r.Body).Decode(&params)
 	if err != nil {
 		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to decode request body")
-		jsonResponse(w, http.StatusBadRequest, &mautrix.RespError{
-			Err:     "Failed to decode request body",
-			ErrCode: mautrix.MNotJSON.ErrCode,
-		})
+		mautrix.MNotJSON.WithMessage("Failed to decode request body").Write(w)
 		return
 	}
 	login := r.Context().Value(provisioningLoginProcessKey).(*ProvLogin)
@@ -471,6 +488,9 @@ func (prov *ProvisioningAPI) PostLoginSubmitInput(w http.ResponseWriter, r *http
 	default:
 		panic("Impossible state")
 	}
+	if err == nil && nextStep == nil {
+		err = ErrNilStep
+	}
 	if err != nil {
 		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to submit input")
 		RespondWithError(w, err, "Internal error submitting input")
@@ -480,30 +500,30 @@ func (prov *ProvisioningAPI) PostLoginSubmitInput(w http.ResponseWriter, r *http
 	if nextStep.Type == bridgev2.LoginStepTypeComplete {
 		prov.handleCompleteStep(r.Context(), login, nextStep)
 	}
-	jsonResponse(w, http.StatusOK, &RespSubmitLogin{LoginID: login.ID, LoginStep: nextStep})
+	exhttp.WriteJSONResponse(w, http.StatusOK, &RespSubmitLogin{LoginID: login.ID, LoginStep: nextStep})
 }
 
 func (prov *ProvisioningAPI) PostLoginWait(w http.ResponseWriter, r *http.Request) {
 	login := r.Context().Value(provisioningLoginProcessKey).(*ProvLogin)
 	nextStep, err := login.Process.(bridgev2.LoginProcessDisplayAndWait).Wait(r.Context())
+	if err == nil && nextStep == nil {
+		err = ErrNilStep
+	}
 	if err != nil {
 		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to wait")
-		jsonResponse(w, http.StatusInternalServerError, &mautrix.RespError{
-			Err:     "Failed to wait",
-			ErrCode: "M_UNKNOWN",
-		})
+		RespondWithError(w, err, "Internal error waiting for login")
 		return
 	}
 	login.NextStep = nextStep
 	if nextStep.Type == bridgev2.LoginStepTypeComplete {
 		prov.handleCompleteStep(r.Context(), login, nextStep)
 	}
-	jsonResponse(w, http.StatusOK, &RespSubmitLogin{LoginID: login.ID, LoginStep: nextStep})
+	exhttp.WriteJSONResponse(w, http.StatusOK, &RespSubmitLogin{LoginID: login.ID, LoginStep: nextStep})
 }
 
 func (prov *ProvisioningAPI) PostLogout(w http.ResponseWriter, r *http.Request) {
 	user := prov.GetUser(r)
-	userLoginID := networkid.UserLoginID(mux.Vars(r)["loginID"])
+	userLoginID := networkid.UserLoginID(r.PathValue("loginID"))
 	if userLoginID == "all" {
 		for {
 			login := user.GetDefaultLogin()
@@ -515,15 +535,12 @@ func (prov *ProvisioningAPI) PostLogout(w http.ResponseWriter, r *http.Request) 
 	} else {
 		userLogin := prov.br.Bridge.GetCachedUserLoginByID(userLoginID)
 		if userLogin == nil || userLogin.UserMXID != user.MXID {
-			jsonResponse(w, http.StatusNotFound, &mautrix.RespError{
-				Err:     "Login not found",
-				ErrCode: mautrix.MNotFound.ErrCode,
-			})
+			mautrix.MNotFound.WithMessage("Login not found").Write(w)
 			return
 		}
 		userLogin.Logout(r.Context())
 	}
-	jsonResponse(w, http.StatusOK, json.RawMessage("{}"))
+	exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 }
 
 type RespGetLogins struct {
@@ -532,7 +549,7 @@ type RespGetLogins struct {
 
 func (prov *ProvisioningAPI) GetLogins(w http.ResponseWriter, r *http.Request) {
 	user := prov.GetUser(r)
-	jsonResponse(w, http.StatusOK, &RespGetLogins{LoginIDs: user.GetUserLoginIDs()})
+	exhttp.WriteJSONResponse(w, http.StatusOK, &RespGetLogins{LoginIDs: user.GetUserLoginIDs()})
 }
 
 func (prov *ProvisioningAPI) GetExplicitLoginForRequest(w http.ResponseWriter, r *http.Request) (*bridgev2.UserLogin, bool) {
@@ -542,13 +559,19 @@ func (prov *ProvisioningAPI) GetExplicitLoginForRequest(w http.ResponseWriter, r
 	}
 	userLogin := prov.br.Bridge.GetCachedUserLoginByID(userLoginID)
 	if userLogin == nil || userLogin.UserMXID != prov.GetUser(r).MXID {
-		jsonResponse(w, http.StatusNotFound, &mautrix.RespError{
-			Err:     "Login not found",
-			ErrCode: mautrix.MNotFound.ErrCode,
-		})
+		hlog.FromRequest(r).Warn().
+			Str("login_id", string(userLoginID)).
+			Msg("Tried to use non-existent login, returning 404")
+		mautrix.MNotFound.WithMessage("Login not found").Write(w)
 		return nil, true
 	}
 	return userLogin, false
+}
+
+var ErrNotLoggedIn = mautrix.RespError{
+	Err:        "Not logged in",
+	ErrCode:    "FI.MAU.NOT_LOGGED_IN",
+	StatusCode: http.StatusBadRequest,
 }
 
 func (prov *ProvisioningAPI) GetLoginForRequest(w http.ResponseWriter, r *http.Request) *bridgev2.UserLogin {
@@ -558,10 +581,7 @@ func (prov *ProvisioningAPI) GetLoginForRequest(w http.ResponseWriter, r *http.R
 	}
 	userLogin = prov.GetUser(r).GetDefaultLogin()
 	if userLogin == nil {
-		jsonResponse(w, http.StatusBadRequest, &mautrix.RespError{
-			Err:     "Not logged in",
-			ErrCode: "FI.MAU.NOT_LOGGED_IN",
-		})
+		ErrNotLoggedIn.Write(w)
 		return nil
 	}
 	return userLogin
@@ -576,21 +596,8 @@ func RespondWithError(w http.ResponseWriter, err error, message string) {
 	if errors.As(err, &we) {
 		we.Write(w)
 	} else {
-		mautrix.RespError{
-			Err:        message,
-			ErrCode:    "M_UNKNOWN",
-			StatusCode: http.StatusInternalServerError,
-		}.Write(w)
+		mautrix.MUnknown.WithMessage(message).Write(w)
 	}
-}
-
-type RespResolveIdentifier struct {
-	ID          networkid.UserID    `json:"id"`
-	Name        string              `json:"name,omitempty"`
-	AvatarURL   id.ContentURIString `json:"avatar_url,omitempty"`
-	Identifiers []string            `json:"identifiers,omitempty"`
-	MXID        id.UserID           `json:"mxid,omitempty"`
-	DMRoomID    id.RoomID           `json:"dm_room_mxid,omitempty"`
 }
 
 func (prov *ProvisioningAPI) doResolveIdentifier(w http.ResponseWriter, r *http.Request, createChat bool) {
@@ -598,113 +605,18 @@ func (prov *ProvisioningAPI) doResolveIdentifier(w http.ResponseWriter, r *http.
 	if login == nil {
 		return
 	}
-	api, ok := login.Client.(bridgev2.IdentifierResolvingNetworkAPI)
-	if !ok {
-		jsonResponse(w, http.StatusNotImplemented, &mautrix.RespError{
-			Err:     "This bridge does not support resolving identifiers",
-			ErrCode: mautrix.MUnrecognized.ErrCode,
-		})
-		return
-	}
-	resp, err := api.ResolveIdentifier(r.Context(), mux.Vars(r)["identifier"], createChat)
+	resp, err := provisionutil.ResolveIdentifier(r.Context(), login, r.PathValue("identifier"), createChat)
 	if err != nil {
-		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to resolve identifier")
 		RespondWithError(w, err, "Internal error resolving identifier")
-		return
 	} else if resp == nil {
-		jsonResponse(w, http.StatusNotFound, &mautrix.RespError{
-			ErrCode: mautrix.MNotFound.ErrCode,
-			Err:     "Identifier not found",
-		})
-		return
-	}
-	apiResp := &RespResolveIdentifier{
-		ID: resp.UserID,
-	}
-	status := http.StatusOK
-	if resp.Ghost != nil {
-		if resp.UserInfo != nil {
-			resp.Ghost.UpdateInfo(r.Context(), resp.UserInfo)
-		}
-		apiResp.Name = resp.Ghost.Name
-		apiResp.AvatarURL = resp.Ghost.AvatarMXC
-		apiResp.Identifiers = resp.Ghost.Identifiers
-		apiResp.MXID = resp.Ghost.Intent.GetMXID()
-	} else if resp.UserInfo != nil && resp.UserInfo.Name != nil {
-		apiResp.Name = *resp.UserInfo.Name
-	}
-	if resp.Chat != nil {
-		if resp.Chat.Portal == nil {
-			resp.Chat.Portal, err = prov.br.Bridge.GetPortalByKey(r.Context(), resp.Chat.PortalKey)
-			if err != nil {
-				zerolog.Ctx(r.Context()).Err(err).Msg("Failed to get portal")
-				jsonResponse(w, http.StatusInternalServerError, &mautrix.RespError{
-					Err:     "Failed to get portal",
-					ErrCode: "M_UNKNOWN",
-				})
-				return
-			}
-		}
-		if createChat && resp.Chat.Portal.MXID == "" {
+		mautrix.MNotFound.WithMessage("Identifier not found").Write(w)
+	} else {
+		status := http.StatusOK
+		if resp.JustCreated {
 			status = http.StatusCreated
-			err = resp.Chat.Portal.CreateMatrixRoom(r.Context(), login, resp.Chat.PortalInfo)
-			if err != nil {
-				zerolog.Ctx(r.Context()).Err(err).Msg("Failed to create portal room")
-				jsonResponse(w, http.StatusInternalServerError, &mautrix.RespError{
-					Err:     "Failed to create portal room",
-					ErrCode: "M_UNKNOWN",
-				})
-				return
-			}
 		}
-		apiResp.DMRoomID = resp.Chat.Portal.MXID
+		exhttp.WriteJSONResponse(w, status, resp)
 	}
-	jsonResponse(w, status, apiResp)
-}
-
-type RespGetContactList struct {
-	Contacts []*RespResolveIdentifier `json:"contacts"`
-}
-
-func (prov *ProvisioningAPI) processResolveIdentifiers(ctx context.Context, resp []*bridgev2.ResolveIdentifierResponse) (apiResp []*RespResolveIdentifier) {
-	apiResp = make([]*RespResolveIdentifier, len(resp))
-	for i, contact := range resp {
-		apiContact := &RespResolveIdentifier{
-			ID: contact.UserID,
-		}
-		apiResp[i] = apiContact
-		if contact.UserInfo != nil {
-			if contact.UserInfo.Name != nil {
-				apiContact.Name = *contact.UserInfo.Name
-			}
-			if contact.UserInfo.Identifiers != nil {
-				apiContact.Identifiers = contact.UserInfo.Identifiers
-			}
-		}
-		if contact.Ghost != nil {
-			if contact.Ghost.Name != "" {
-				apiContact.Name = contact.Ghost.Name
-			}
-			if len(contact.Ghost.Identifiers) >= len(apiContact.Identifiers) {
-				apiContact.Identifiers = contact.Ghost.Identifiers
-			}
-			apiContact.AvatarURL = contact.Ghost.AvatarMXC
-			apiContact.MXID = contact.Ghost.Intent.GetMXID()
-		}
-		if contact.Chat != nil {
-			if contact.Chat.Portal == nil {
-				var err error
-				contact.Chat.Portal, err = prov.br.Bridge.GetPortalByKey(ctx, contact.Chat.PortalKey)
-				if err != nil {
-					zerolog.Ctx(ctx).Err(err).Msg("Failed to get portal")
-				}
-			}
-			if contact.Chat.Portal != nil {
-				apiContact.DMRoomID = contact.Chat.Portal.MXID
-			}
-		}
-	}
-	return
 }
 
 func (prov *ProvisioningAPI) GetContactList(w http.ResponseWriter, r *http.Request) {
@@ -712,31 +624,16 @@ func (prov *ProvisioningAPI) GetContactList(w http.ResponseWriter, r *http.Reque
 	if login == nil {
 		return
 	}
-	api, ok := login.Client.(bridgev2.ContactListingNetworkAPI)
-	if !ok {
-		jsonResponse(w, http.StatusNotImplemented, &mautrix.RespError{
-			Err:     "This bridge does not support listing contacts",
-			ErrCode: mautrix.MUnrecognized.ErrCode,
-		})
-		return
-	}
-	resp, err := api.GetContactList(r.Context())
+	resp, err := provisionutil.GetContactList(r.Context(), login)
 	if err != nil {
-		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to get contact list")
-		RespondWithError(w, err, "Internal error fetching contact list")
+		RespondWithError(w, err, "Internal error getting contact list")
 		return
 	}
-	jsonResponse(w, http.StatusOK, &RespGetContactList{
-		Contacts: prov.processResolveIdentifiers(r.Context(), resp),
-	})
+	exhttp.WriteJSONResponse(w, http.StatusOK, resp)
 }
 
 type ReqSearchUsers struct {
 	Query string `json:"query"`
-}
-
-type RespSearchUsers struct {
-	Results []*RespResolveIdentifier `json:"results"`
 }
 
 func (prov *ProvisioningAPI) PostSearchUsers(w http.ResponseWriter, r *http.Request) {
@@ -744,33 +641,19 @@ func (prov *ProvisioningAPI) PostSearchUsers(w http.ResponseWriter, r *http.Requ
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to decode request body")
-		jsonResponse(w, http.StatusBadRequest, &mautrix.RespError{
-			Err:     "Failed to decode request body",
-			ErrCode: mautrix.MNotJSON.ErrCode,
-		})
+		mautrix.MNotJSON.WithMessage("Failed to decode request body").Write(w)
 		return
 	}
 	login := prov.GetLoginForRequest(w, r)
 	if login == nil {
 		return
 	}
-	api, ok := login.Client.(bridgev2.UserSearchingNetworkAPI)
-	if !ok {
-		jsonResponse(w, http.StatusNotImplemented, &mautrix.RespError{
-			Err:     "This bridge does not support searching for users",
-			ErrCode: mautrix.MUnrecognized.ErrCode,
-		})
-		return
-	}
-	resp, err := api.SearchUsers(r.Context(), req.Query)
+	resp, err := provisionutil.SearchUsers(r.Context(), login, req.Query)
 	if err != nil {
-		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to get contact list")
-		RespondWithError(w, err, "Internal error fetching contact list")
+		RespondWithError(w, err, "Internal error searching users")
 		return
 	}
-	jsonResponse(w, http.StatusOK, &RespSearchUsers{
-		Results: prov.processResolveIdentifiers(r.Context(), resp),
-	})
+	exhttp.WriteJSONResponse(w, http.StatusOK, resp)
 }
 
 func (prov *ProvisioningAPI) GetResolveIdentifier(w http.ResponseWriter, r *http.Request) {
@@ -782,12 +665,114 @@ func (prov *ProvisioningAPI) PostCreateDM(w http.ResponseWriter, r *http.Request
 }
 
 func (prov *ProvisioningAPI) PostCreateGroup(w http.ResponseWriter, r *http.Request) {
+	var req bridgev2.GroupCreateParams
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to decode request body")
+		mautrix.MNotJSON.WithMessage("Failed to decode request body").Write(w)
+		return
+	}
+	req.Type = r.PathValue("type")
 	login := prov.GetLoginForRequest(w, r)
 	if login == nil {
 		return
 	}
-	jsonResponse(w, http.StatusNotImplemented, &mautrix.RespError{
-		Err:     "Creating groups is not yet implemented",
-		ErrCode: mautrix.MUnrecognized.ErrCode,
+	resp, err := provisionutil.CreateGroup(r.Context(), login, &req)
+	if err != nil {
+		RespondWithError(w, err, "Internal error creating group")
+		return
+	}
+	exhttp.WriteJSONResponse(w, http.StatusOK, resp)
+}
+
+type ReqExportCredentials struct {
+	RemoteID networkid.UserLoginID `json:"remote_id"`
+}
+
+type RespExportCredentials struct {
+	Credentials any `json:"credentials"`
+}
+
+func (prov *ProvisioningAPI) PostInitSessionTransfer(w http.ResponseWriter, r *http.Request) {
+	prov.sessionTransfersLock.Lock()
+	defer prov.sessionTransfersLock.Unlock()
+
+	var req ReqExportCredentials
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to decode request body")
+		mautrix.MNotJSON.WithMessage("Failed to decode request body").Write(w)
+		return
+	}
+
+	user := prov.GetUser(r)
+	logins := user.GetUserLogins()
+	var loginToExport *bridgev2.UserLogin
+	for _, login := range logins {
+		if login.ID == req.RemoteID {
+			loginToExport = login
+			break
+		}
+	}
+	if loginToExport == nil {
+		mautrix.MNotFound.WithMessage("No matching user login found").Write(w)
+		return
+	}
+
+	client, ok := loginToExport.Client.(bridgev2.CredentialExportingNetworkAPI)
+	if !ok {
+		mautrix.MUnrecognized.WithMessage("This bridge does not support exporting credentials").Write(w)
+		return
+	}
+
+	if _, ok := prov.sessionTransfers[loginToExport.ID]; ok {
+		// Warn, but allow, double exports. This might happen if a client crashes handling creds,
+		// and should be safe to call multiple times.
+		zerolog.Ctx(r.Context()).Warn().Msg("Exporting already exported credentials")
+	}
+
+	// Disconnect now so we don't use the same network session in two places at once
+	client.Disconnect()
+	exhttp.WriteJSONResponse(w, http.StatusOK, &RespExportCredentials{
+		Credentials: client.ExportCredentials(r.Context()),
 	})
+}
+
+func (prov *ProvisioningAPI) PostFinishSessionTransfer(w http.ResponseWriter, r *http.Request) {
+	prov.sessionTransfersLock.Lock()
+	defer prov.sessionTransfersLock.Unlock()
+
+	var req ReqExportCredentials
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		zerolog.Ctx(r.Context()).Err(err).Msg("Failed to decode request body")
+		mautrix.MNotJSON.WithMessage("Failed to decode request body").Write(w)
+		return
+	}
+
+	user := prov.GetUser(r)
+	logins := user.GetUserLogins()
+	var loginToExport *bridgev2.UserLogin
+	for _, login := range logins {
+		if login.ID == req.RemoteID {
+			loginToExport = login
+			break
+		}
+	}
+	if loginToExport == nil {
+		mautrix.MNotFound.WithMessage("No matching user login found").Write(w)
+		return
+	} else if _, ok := prov.sessionTransfers[loginToExport.ID]; !ok {
+		mautrix.MBadState.WithMessage("No matching credential export found").Write(w)
+		return
+	}
+
+	zerolog.Ctx(r.Context()).Info().
+		Str("remote_name", string(req.RemoteID)).
+		Msg("Logging out remote after finishing credential export")
+
+	loginToExport.Client.LogoutRemote(r.Context())
+	delete(prov.sessionTransfers, req.RemoteID)
+
+	exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 }

@@ -36,9 +36,12 @@ type Event[MetaType any] struct {
 	RawArgs string
 
 	Ctx     context.Context
+	Log     *zerolog.Logger
 	Proc    *Processor[MetaType]
 	Handler *Handler[MetaType]
 	Meta    MetaType
+
+	redactedBy id.EventID
 }
 
 var IDHTMLParser = &format.HTMLParser{
@@ -59,8 +62,8 @@ var IDHTMLParser = &format.HTMLParser{
 
 // ParseEvent parses a message into a command event struct.
 func ParseEvent[MetaType any](ctx context.Context, evt *event.Event) *Event[MetaType] {
-	content := evt.Content.Parsed.(*event.MessageEventContent)
-	if content.MsgType == event.MsgNotice || content.RelatesTo.GetReplaceID() != "" {
+	content, ok := evt.Content.Parsed.(*event.MessageEventContent)
+	if !ok || content.MsgType == event.MsgNotice || content.RelatesTo.GetReplaceID() != "" {
 		return nil
 	}
 	text := content.Body
@@ -70,13 +73,21 @@ func ParseEvent[MetaType any](ctx context.Context, evt *event.Event) *Event[Meta
 	if len(text) == 0 {
 		return nil
 	}
+	return RawTextToEvent[MetaType](ctx, evt, text)
+}
+
+func RawTextToEvent[MetaType any](ctx context.Context, evt *event.Event, text string) *Event[MetaType] {
 	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		parts = []string{""}
+	}
 	return &Event[MetaType]{
 		Event:    evt,
 		RawInput: text,
 		Command:  strings.ToLower(parts[0]),
 		Args:     parts[1:],
 		RawArgs:  strings.TrimLeft(strings.TrimPrefix(text, parts[0]), " "),
+		Log:      zerolog.Ctx(ctx),
 		Ctx:      ctx,
 	}
 }
@@ -89,6 +100,7 @@ type ReplyOpts struct {
 	SendAsText       bool
 	Edit             id.EventID
 	OverrideMentions *event.Mentions
+	Extra            map[string]any
 }
 
 func (evt *Event[MetaType]) Reply(msg string, args ...any) id.EventID {
@@ -115,7 +127,14 @@ func (evt *Event[MetaType]) Respond(msg string, opts ReplyOpts) id.EventID {
 	if opts.OverrideMentions != nil {
 		content.Mentions = opts.OverrideMentions
 	}
-	resp, err := evt.Proc.Client.SendMessageEvent(evt.Ctx, evt.RoomID, event.EventMessage, content)
+	var wrapped any = &content
+	if opts.Extra != nil {
+		wrapped = &event.Content{
+			Parsed: &content,
+			Raw:    opts.Extra,
+		}
+	}
+	resp, err := evt.Proc.Client.SendMessageEvent(evt.Ctx, evt.RoomID, event.EventMessage, wrapped)
 	if err != nil {
 		zerolog.Ctx(evt.Ctx).Err(err).Msg("Failed to send reply")
 		return ""
@@ -133,11 +152,15 @@ func (evt *Event[MetaType]) React(emoji string) id.EventID {
 }
 
 func (evt *Event[MetaType]) Redact() id.EventID {
+	if evt.redactedBy != "" {
+		return evt.redactedBy
+	}
 	resp, err := evt.Proc.Client.RedactEvent(evt.Ctx, evt.RoomID, evt.ID)
 	if err != nil {
 		zerolog.Ctx(evt.Ctx).Err(err).Msg("Failed to redact command")
 		return ""
 	}
+	evt.redactedBy = resp.EventID
 	return resp.EventID
 }
 

@@ -66,6 +66,7 @@ var (
 	FeatureMutualRooms         = UnstableFeature{UnstableFlag: "uk.half-shot.msc2666.query_mutual_rooms"}
 	FeatureUserRedaction       = UnstableFeature{UnstableFlag: "org.matrix.msc4194"}
 	FeatureViewRedactedContent = UnstableFeature{UnstableFlag: "fi.mau.msc2815"}
+	FeatureAccountModeration   = UnstableFeature{UnstableFlag: "uk.timedout.msc4323"}
 
 	BeeperFeatureHungry               = UnstableFeature{UnstableFlag: "com.beeper.hungry"}
 	BeeperFeatureBatchSending         = UnstableFeature{UnstableFlag: "com.beeper.batch_sending"}
@@ -115,6 +116,8 @@ var (
 	SpecV111 = MustParseSpecVersion("v1.11")
 	SpecV112 = MustParseSpecVersion("v1.12")
 	SpecV113 = MustParseSpecVersion("v1.13")
+	SpecV114 = MustParseSpecVersion("v1.14")
+	SpecV115 = MustParseSpecVersion("v1.15")
 )
 
 func (svf SpecVersionFormat) String() string {

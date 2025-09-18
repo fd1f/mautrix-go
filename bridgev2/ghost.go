@@ -85,7 +85,13 @@ func (br *Bridge) GetGhostByMXID(ctx context.Context, mxid id.UserID) (*Ghost, e
 func (br *Bridge) GetGhostByID(ctx context.Context, id networkid.UserID) (*Ghost, error) {
 	br.cacheLock.Lock()
 	defer br.cacheLock.Unlock()
-	return br.unlockedGetGhostByID(ctx, id, false)
+	ghost, err := br.unlockedGetGhostByID(ctx, id, false)
+	if err != nil {
+		return nil, err
+	} else if ghost == nil {
+		panic(fmt.Errorf("unlockedGetGhostByID(ctx, %q, false) returned nil", id))
+	}
+	return ghost, nil
 }
 
 func (br *Bridge) GetExistingGhostByID(ctx context.Context, id networkid.UserID) (*Ghost, error) {
@@ -152,7 +158,7 @@ func (ghost *Ghost) UpdateName(ctx context.Context, name string) bool {
 }
 
 func (ghost *Ghost) UpdateAvatar(ctx context.Context, avatar *Avatar) bool {
-	if ghost.AvatarID == avatar.ID && ghost.AvatarSet {
+	if ghost.AvatarID == avatar.ID && (avatar.Remove || ghost.AvatarMXC != "") && ghost.AvatarSet {
 		return false
 	}
 	ghost.AvatarID = avatar.ID
@@ -162,7 +168,7 @@ func (ghost *Ghost) UpdateAvatar(ctx context.Context, avatar *Avatar) bool {
 			ghost.AvatarSet = false
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to reupload avatar")
 			return true
-		} else if newHash == ghost.AvatarHash && ghost.AvatarSet {
+		} else if newHash == ghost.AvatarHash && ghost.AvatarMXC != "" && ghost.AvatarSet {
 			return true
 		}
 		ghost.AvatarHash = newHash
@@ -177,6 +183,18 @@ func (ghost *Ghost) UpdateAvatar(ctx context.Context, avatar *Avatar) bool {
 		ghost.AvatarSet = true
 	}
 	return true
+}
+
+func (ghost *Ghost) getExtraProfileMeta() *event.BeeperProfileExtra {
+	bridgeName := ghost.Bridge.Network.GetName()
+	return &event.BeeperProfileExtra{
+		RemoteID:     string(ghost.ID),
+		Identifiers:  ghost.Identifiers,
+		Service:      bridgeName.BeeperBridgeType,
+		Network:      bridgeName.NetworkID,
+		IsBridgeBot:  false,
+		IsNetworkBot: ghost.IsBot,
+	}
 }
 
 func (ghost *Ghost) UpdateContactInfo(ctx context.Context, identifiers []string, isBot *bool) bool {
@@ -194,16 +212,7 @@ func (ghost *Ghost) UpdateContactInfo(ctx context.Context, identifiers []string,
 	if isBot != nil {
 		ghost.IsBot = *isBot
 	}
-	bridgeName := ghost.Bridge.Network.GetName()
-	meta := &event.BeeperProfileExtra{
-		RemoteID:     string(ghost.ID),
-		Identifiers:  ghost.Identifiers,
-		Service:      bridgeName.BeeperBridgeType,
-		Network:      bridgeName.NetworkID,
-		IsBridgeBot:  false,
-		IsNetworkBot: ghost.IsBot,
-	}
-	err := ghost.Intent.SetExtraProfileMeta(ctx, meta)
+	err := ghost.Intent.SetExtraProfileMeta(ctx, ghost.getExtraProfileMeta())
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to set extra profile metadata")
 	} else {
