@@ -46,6 +46,7 @@ type FilterPart struct {
 	Limit                     int          `json:"limit,omitempty"`
 	NotSenders                []id.UserID  `json:"not_senders,omitempty"`
 	NotTypes                  []event.Type `json:"not_types,omitempty"`
+	NotAggregatedRelations    []event.Type `json:"not_aggregated_relations,omitempty"`
 	Senders                   []id.UserID  `json:"senders,omitempty"`
 	Types                     []event.Type `json:"types,omitempty"`
 	ContainsURL               *bool        `json:"contains_url,omitempty"`
